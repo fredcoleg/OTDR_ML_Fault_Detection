@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -6,6 +7,14 @@ import torch.nn as nn
 from scipy.signal import savgol_filter
 import matplotlib.pyplot as plt
 import streamlit as st
+
+# Safe import for serial hardware control
+try:
+    import serial
+
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -94,13 +103,61 @@ def suppress_adjacent_events(events, distance_radius=0.6):
 
 
 # ==========================================
-# SIDEBAR CONTROLS
+# SIDEBAR CONTROLS & DATA INGESTION
 # ==========================================
 st.sidebar.title("🔧 Pipeline Controls")
 st.sidebar.markdown("---")
 
-uploaded_file = st.sidebar.file_uploader("Upload OTDR Trace CSV", type=["csv"])
+st.sidebar.subheader("📥 Data Source Selection")
+input_mode = st.sidebar.radio(
+    "Choose Input Method:",
+    ["Synthetic Demo Trace", "Upload File (.csv)", "Live USB Stream (Hardware)"]
+)
 
+df = None
+
+if input_mode == "Synthetic Demo Trace":
+    df = generate_default_trace()
+
+elif input_mode == "Upload File (.csv)":
+    uploaded_file = st.sidebar.file_uploader("Upload OTDR Trace CSV", type=["csv"])
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+    else:
+        st.sidebar.warning("Upload a CSV file to execute model inference.")
+
+elif input_mode == "Live USB Stream (Hardware)":
+    if not SERIAL_AVAILABLE:
+        st.sidebar.error("`pyserial` not installed. Run `pip install pyserial` in terminal.")
+    else:
+        st.sidebar.markdown("**USB Serial Parameters**")
+        com_port = st.sidebar.text_input("COM Port", value="COM3")
+        baud_rate = st.sidebar.number_input("Baud Rate", value=115200, step=1200)
+        max_dist = st.sidebar.number_input("Target Cable Distance (km)", value=20.0, step=1.0)
+
+        if st.sidebar.button("📡 Read from USB OTDR"):
+            try:
+                with st.spinner("Acquiring trace data from USB port..."):
+                    ser = serial.Serial(com_port, baud_rate, timeout=3)
+                    ser.write(b'TRIGGER\n')
+                    time.sleep(1)
+                    lines = ser.readlines()
+                    ser.close()
+
+                    parsed_vals = [float(l.decode().strip()) for l in lines if l.strip()]
+                    if parsed_vals:
+                        dist_axis = np.linspace(0, max_dist, len(parsed_vals))
+                        df = pd.DataFrame({
+                            "Distance_km": dist_axis,
+                            "Noisy_Power_dB": np.array(parsed_vals)
+                        })
+                        st.sidebar.success(f"Acquired {len(parsed_vals)} sample points!")
+                    else:
+                        st.sidebar.error("No valid optical data received from COM port.")
+            except Exception as e:
+                st.sidebar.error(f"Serial Connection Error: {e}")
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Inference Hyperparameters")
 confidence_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.50, max_value=0.99, value=0.85, step=0.01)
 nms_radius = st.sidebar.slider("NMS Clustering Radius (km)", min_value=0.1, max_value=2.0, value=0.6, step=0.1)
@@ -116,13 +173,9 @@ st.title("⚡ OTDR Machine Learning Optical Fault Detection System")
 st.markdown(
     "Automated fiber optic fault detection, classification, and event localization using a 1D Convolutional Neural Network.")
 
-# Load Data
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    st.success("Custom OTDR trace file loaded successfully.")
-else:
-    df = generate_default_trace()
-    st.info("Using baseline 20 km synthetic OTDR trace. (Upload a CSV file in the sidebar to analyze custom traces).")
+if df is None:
+    st.info("👈 Please select or provide trace data in the sidebar to run signal processing.")
+    st.stop()
 
 # Process Signal
 dist = df["Distance_km"].values
